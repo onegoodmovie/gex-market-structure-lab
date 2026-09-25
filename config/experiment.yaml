@@ -1,0 +1,317 @@
+# SPX Self-Computed GEX — experiment configuration
+# Every value that the study must be able to reproduce lives here, not in code.
+# `null` means "not yet determined" and is expected to fail loudly rather than
+# silently default. See docs/METHODOLOGY.md.
+
+experiment:
+  name: spx_self_computed_gex
+  spec_version: "1.0"
+  # CHANGED T2 (2026-07-29): 15 -> 5. The study ends Friday 2026-07-31.
+  # Reasons are in docs/WIND_DOWN.md and the final report; the short version is
+  # that the two questions still open are mechanism questions, which more days
+  # cannot settle. Changing a stopping rule mid-study is legitimate; changing it
+  # silently is not, so it is recorded in three places and in the report.
+  target_valid_days: 5
+  target_valid_days_original: 15
+  end_date: "2026-07-31"
+  # The public release is a frozen research artifact. It never schedules or
+  # continues live capture on the user's machine.
+  capture_continues_after_end: false
+
+# --- §4 / §19.1 data provider -------------------------------------------------
+# CHOSEN: Massive Options Starter. Known tier properties, not guesses:
+#   15-minute delay, unlimited API calls, greeks + IV + open interest,
+#   NO quotes and NO trades (those are Advanced-tier only).
+provider:
+  # Safe public default: all examples and tests are offline and deterministic.
+  # The historical study used Massive; select it explicitly only after setting
+  # MASSIVE_API_KEY and reviewing the provider's current terms.
+  name: synthetic               # massive | synthetic
+  plan: starter
+  # The credential is read at the moment of the request and never stored,
+  # printed, logged, or written to a file. It travels in an Authorization
+  # header, not a query parameter, so it cannot leak into `next_url`, proxy
+  # logs, or the request_params persisted in every .meta.json.
+  auth_scheme: bearer
+  credential:
+    source: env                 # public release never assumes a local keychain
+    api_key_env: MASSIVE_API_KEY
+  base_url: https://api.massive.com
+  underlying_ticker: "I:SPX"
+  page_limit: 250               # contracts per page
+  max_pages: 200                # hard stop; a full SPX 45-DTE chain is ~10-40 pages
+  request_timeout_seconds: 30
+  max_retries: 5
+  retry_backoff_seconds: 2.0
+  sleep_between_pages_seconds: 0.0   # unlimited calls on Starter; no throttle needed
+  extra_params: {}                   # e.g. {sort: ticker, order: asc}
+
+  # §5.3 — a known property of the tier, NOT detected at runtime. Starter has no
+  # `last_quote` block at all, so there is no `timeframe` field to read and
+  # nothing to probe. Hardcoded, and every downstream rule keys off this value.
+  is_delayed: true
+  delay_minutes: 15             # SINGLE source of truth for the delay.
+                                # Download times, the level-4 asof fallback, and
+                                # the implied-delay comparison all derive from
+                                # this one number — nothing restates it.
+  has_quotes: false             # Starter: no last_quote -> no bid/ask/mid
+  has_trades: false             # Starter: no last_trade
+
+  # Continuous measurement of the delay assumption above. Each capture matches
+  # the snapshot's underlying price against transmission_spot.csv and reports
+  # the lag that best explains it. This is a check on `delay_minutes`, never an
+  # input to it — a drifting value is reported, never silently applied.
+  implied_delay:
+    enabled: true
+    warn_threshold_minutes: 5.0
+    # A match only counts if the runner-up transmission point is at least this
+    # many index points further away. On a flat day several points sit within
+    # noise of each other and the lag is simply not identifiable from spot.
+    ambiguity_margin_points: 2.0
+
+  # Offline stand-in used for wiring tests and the §17 fixture run only.
+  synthetic:
+    spot: 7400.0
+    seed: 20260101
+    timeframe: REAL-TIME
+    strike_span_pct: 20.0        # wide enough that the deep-ITM greeks dropout fires
+    emulate_plan: starter        # starter omits last_quote, matching the real tier
+
+# --- §5 capture ---------------------------------------------------------------
+capture:
+  expiry_scope_max_dte: 45      # §19.2
+  roots: [SPX, SPXW]            # §5.1 both required, never merged before §6
+
+  # The times the study is about — the asof each snapshot is meant to carry.
+  # These are the capture labels and the §8.1 pairing times.
+  # 1030 added T1. 09:45 is the capture most exposed to the provider's
+  # unsettled open, and the whole frozen map is built on it, so a second early
+  # base is captured and the two are compared rather than one being argued for.
+  # Calls are unlimited on this tier, so the extra snapshot costs nothing.
+  target_asof_times: ["0945", "1030", "1400", "1545"]
+
+  # Download times are NOT listed here. They are derived as
+  # target_asof + provider.delay_minutes, which on a 15-minute tier gives
+  # 10:00 / 14:15 / 16:00. Writing them down as well would create a second
+  # source of truth that silently disagrees the day the tier changes.
+  oi_base_deadline_et: "09:30"
+  timezone: America/New_York
+  # How far the actual download may drift from its derived time before the
+  # capture says so. §8.1 pairing depends on the 14:00 row landing on 14:00.
+  download_drift_warn_minutes: 5.0
+
+# --- §5.3 as-of timestamp resolution ------------------------------------------
+# Priority order. The probe and every capture record which level actually hit;
+# a lower level is not a warning to be skimmed past, it changes what T means.
+#   1  last_quote.last_updated        (expected UNAVAILABLE on Starter)
+#   2  underlying_asset.last_updated
+#   3  day.last_updated
+#   4  inferred: request_time - delay_seconds, sets asof_is_inferred = true
+#
+# `require_intraday_variation` is the check that separates "has a timestamp"
+# from "has a usable timestamp": if 09:45 and 14:00 on the same day resolve to
+# the same instant, the field is a daily-granularity stamp and is meaningless
+# for a snapshot. On a match the capture degrades itself to level 4.
+asof_resolution:
+  priority: [last_quote.last_updated, underlying_asset.last_updated, day.last_updated]
+  require_intraday_variation: true
+  fallback_level: 4
+  # A snapshot stamp describes one instant, so its values must cluster across
+  # contracts. Verified against the live API 2026-07-27: `day.last_updated`
+  # holds 138 distinct values spanning back to 2025-07-24 — it is each
+  # contract's last *trade* date. Any level whose values span more than this
+  # is rejected as not-a-snapshot-stamp and the ladder moves on.
+  max_span_minutes: 60.0
+
+# --- §6 normalization ---------------------------------------------------------
+normalization:
+  time_convention: calendar     # calendar | trading (§6.3, decided by §7.2)
+  expiration_timestamp_source: derived   # derived | provider (§6.2, decided by §7.2)
+  settlement_times_et:
+    SPX: "09:30:00"             # AM-settled
+    SPXW: "16:00:00"            # PM-settled
+  severe_drop_threshold_pct: 5.0
+
+  # The hand-recorded spot is matched to the capture's resolved as-of, not to
+  # its label — a download that slips carries a different instant than it was
+  # aiming at. Nearest recorded instant only, never interpolated; a wider gap
+  # is a severe flag rather than a plausible-looking guess.
+  spot_match_max_gap_minutes: 5.0
+
+  # Vendor greeks that are impossible, not merely absent. Measured on the live
+  # chain 2026-07-27: gamma < 0 on 5.6% of contracts, vega < 0 on 6.2%, IV
+  # below 1% on 11.0% — all concentrated deep ITM where IV inversion fails
+  # (43.8% of strikes >15% ITM, 0% of OTM). Flagged and excluded from every
+  # computed quantity via `usable_for_gex`; never dropped from the record.
+  #
+  # The gate is OI-weighted near the money, not a raw count: these rows are
+  # ~11% of contracts but carried only 0.017% of the open interest within 10%
+  # of spot, and a count-based threshold would fail every single day.
+  sanity:
+    min_massive_iv: 0.01           # 1% vol
+    max_massive_iv: 3.0            # 300% vol
+    max_ntm_oi_lost_pct: 1.0
+
+  # §19.3 is VOID: with no quotes on Starter there is no bid, no ask, and no
+  # provider mark, so there is nothing to choose between. `mid` does not exist.
+
+  # §6.4 filters. Two of them have no quote data to act on. They are recorded as
+  # not applicable rather than deleted, so the day's data-quality record shows a
+  # deliberate N/A instead of a silently absent check.
+  filters:
+    drop_zero_open_interest: applied
+    drop_crossed_market: not_applicable_on_this_plan   # needs bid > ask
+    flag_zero_bid: not_applicable_on_this_plan         # needs bid
+    flag_stale_quote: applied                          # uses the resolved asof
+    drop_duplicate_contract: applied
+    flag_bad_massive_iv: applied
+  filters_na_reason: "Massive Options Starter returns no last_quote block"
+
+# --- §7 validation paths ------------------------------------------------------
+validation:
+  # §7.1 Path A is a self-consistency check on OUR Black-Scholes, reported per
+  # expiry bucket with both median and p90. It is NO LONGER a gate on M2, and
+  # it cannot reach 1%: Massive prices on a CRR binomial tree with
+  # finite-difference vega, so this is a cross-model comparison with an
+  # irreducible residual. See METHODOLOGY §3.4.
+  path_a: diagnostic
+  path_a_reference_median_pct: 1.0   # the spec's number, kept for reference only
+  path_a_blocks_m2: false
+
+  # §Q1 is a SMOKE TEST, not a calibration. The study is an observation
+  # framework, not a replacement for optioncharts' numbers, so the question is
+  # "are we in the same world" rather than "do we agree to a tolerance".
+  q1_smoke_test:
+    require_flip_same_side_of_spot: true
+    flip_max_abs_diff_pts: 50.0
+    require_net_gex_same_sign: true
+    net_gex_max_log10_ratio: 1.0     # within one order of magnitude
+  path_b: not_applicable        # N/A is not a failure; it is a recorded fact
+  path_b_reason: >-
+    Massive Options Starter returns no quotes, so there is no mid to invert IV
+    from. Path B is impossible on this tier. Path A is unaffected and remains
+    the hard gate (§7.1).
+
+  # §7.2 fourth dimension: Massive's expiration-timestamp convention.
+  # Path A compares our gamma to theirs, so it must use THEIR expiry or it
+  # measures the convention gap instead of the formula. Our own GEX always uses
+  # the §6.2 settlement times; this offset never leaves the validation path.
+  #
+  # CLOSED, deliberately null. Investigation stopped 2026-07-27 — see
+  # METHODOLOGY §4a. The offset is real (~+3.4h) and uniform across settlement
+  # types, which refutes the expiry-convention reading and points at a constant
+  # added to T. It is not pursued further because the study's core output (Q3's
+  # frozen/actual decomposition) is a difference of two quantities computed
+  # under the SAME convention, so it cancels.
+  massive_expiry_offset_hours: null
+  massive_expiry_investigation: closed
+
+  # M1. The cross-check that replaces Path B. Uses no external data — only a
+  # relation Massive's own numbers must satisfy — which is what makes it
+  # independent of Path A. Diagnostic and §7.2 evidence, not a gate.
+  #
+  # Read the INTERCEPT, not the slope. Since N(d2) + N(-d2) = 1 exactly,
+  # iv_call - iv_put ~ -e^{-rT}*dF/vega: moneyness enters only through vega, so
+  # a forward error is a level shaped like 1/vega, symmetric in d1. Any slope is
+  # a by-product of sampling that U-shape asymmetrically and moves with the
+  # strike distribution. Verified numerically — see docs/METHODOLOGY.md §3.2.
+  put_call_iv_consistency:
+    enabled: true
+    max_abs_intercept: 0.005      # 0.5 vol points
+    max_abs_slope: 0.02           # d(iv_spread) / d(ln K/S)
+    min_pairs_per_bucket: 20
+    # Pairs below this fraction of their expiry's ATM vega are excluded: there
+    # IV is barely determined by price and iv_call-iv_put (which goes as
+    # 1/vega) explodes, swamping an unweighted regression.
+    min_vega_fraction: 0.05
+
+# --- §9 GEX definition --------------------------------------------------------
+gex:
+  definition_version: "1.0"
+  sign_convention: dealers_long_calls_short_puts   # naive convention, an assumption
+  expiry_buckets: ["0DTE", "1-7DTE", "8-30DTE", "aggregate"]
+  zero_dte_late_session: exclude        # exclude | floor
+  min_time_to_expiry_minutes: 30        # only used when mode == floor
+
+  # §9.2, revised. Shifting the download clock by the delay means the 15:45 row
+  # now carries genuine 15:45 data, so the staleness argument for excluding
+  # 0DTE there is gone. The remaining objection is a different one and it is
+  # not about delay at all: §9.1's 1/√T singularity. At 15 minutes to expiry a
+  # single ATM strike swings the number 5× on time decay alone, so the value is
+  # real but not comparable across days.
+  #
+  # Therefore: capture it, compute it, report it — and mark it. It stays out of
+  # the aggregate, where a non-comparable quantity would contaminate a
+  # comparable one.
+  zero_dte_not_cross_day_comparable_times: ["1545"]
+  zero_dte_excluded_from_aggregate_times: ["1545"]
+
+  # 16:00 carries no 0DTE layer at all: for PM-settled SPXW that instant IS
+  # settlement, T = 0, the contracts no longer exist. This is a different
+  # statement from "not comparable" and is not a config choice.
+  zero_dte_absent_times: ["1600"]
+
+# --- §7 rate / dividend conventions ------------------------------------------
+# Filled in by the §7.2 grid search. Left null until Path A reconciles.
+# CHOSEN, not reverse-engineered. The study declares its own conventions and
+# reports them; it no longer tries to recover what Massive used. See
+# docs/METHODOLOGY.md §3.3 for the sensitivity that makes this safe.
+rates:
+  # Both stored CONTINUOUSLY COMPOUNDED on an ACT/365 basis, because that is
+  # what e^{-qT} and d1 need when T is (seconds / 365 / 86400). The quoted
+  # values are neither, so the conversions are written out here rather than
+  # done in someone's head:
+  #
+  #   SOFR 3.64% is simple, ACT/360, overnight. Rolling it daily for N days
+  #   grows by exp(SOFR * N/360); with N = 365T that is exp(r*T) for
+  #   r = SOFR * 365/360 = 0.036906.  Skipping this is a 5.06 bp error.
+  #
+  #   The dividend yield 1.40% is a simple annual yield; the continuous
+  #   equivalent is ln(1 + q) = 0.013903.  Worth -0.97 bp.
+  r: 0.036906                   # = 0.0364 * 365/360
+  q: 0.013903                   # = ln(1.0140)
+  compounding: continuous
+  day_count: ACT/365
+  r_source: "SOFR 3.64% (ACT/360 simple), NY Fed"
+  q_source: "SPX trailing 12-month dividend yield 1.40% (simple annual)"
+  # SOFR is published the next business day, so the value usable on 2026-07-27
+  # is the 2026-07-24 fixing. That is the standard one-business-day lag, not a
+  # staleness problem, and it is recorded so nobody re-derives it later.
+  r_fixing_date: "2026-07-24"
+  r_published: "2026-07-27 08:00 ET"
+  # The quoted dividend yield spans 1.09-1.40% depending on whether ETF
+  # net-of-fee distributions or index dividends are used — a 31 bp range, well
+  # inside the ±50 bp sensitivity that moves the flip by under half a point.
+  q_quoted_range: [0.0109, 0.0140]
+  provisional: false
+  as_of: "2026-07-27"
+  sensitivity_bump: 0.005       # ±50bp, for the reported sensitivity
+
+  # The §7.2 grid search over candidate rates is RETIRED. The study picks its
+  # conventions and reports them rather than solving for Massive's; see
+  # METHODOLOGY §3.3. `implied_drift_scan` survives as a diagnostic only.
+
+# --- §10 frozen map -----------------------------------------------------------
+frozen_map:
+  iv_alignment: sticky_strike   # §10.2 — no switch, deliberately
+  recompute_times: ["0945", "1030", "1130", "1400", "1545", "1600"]
+  surface_base_time: "0945"
+
+# --- §12 actual-surface refresh -----------------------------------------------
+actual_map:
+  # Only captures that carry a real surface. The OI base has no spot and no
+  # usable gamma by design, so it is not a surface time.
+  surface_times: ["0945", "1030", "1400", "1545"]
+
+# --- §11 flip solver ----------------------------------------------------------
+flip_solver:
+  grid_min_pct: -5.0
+  grid_max_pct: 5.0
+  grid_step_points: 5           # must stay finer than the 25-pt SPX strike spacing
+  root_selection_rule: nearest_to_spot
+
+# --- §12 attribution ----------------------------------------------------------
+attribution:
+  baseline_time: "0945"
+  t1_times: ["1400", "1545"]
+  identity_tolerance: 1.0e-6
