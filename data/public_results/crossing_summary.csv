@@ -1,0 +1,5 @@
+bucket,raw_crossings,episodes,crossings_per_day,episodes_per_day,days_to_40_episodes,recross_rate_pct
+0DTE,32,6,6.4,1.2,33.3,81.25
+1-7DTE,17,2,3.4,0.4,100.0,88.24
+8-30DTE,0,0,0.0,0.0,,
+aggregate,19,4,3.8,0.8,50.0,78.95

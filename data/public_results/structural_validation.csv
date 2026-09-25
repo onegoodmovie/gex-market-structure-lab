@@ -1,0 +1,4 @@
+comparison,n,median_flip_error_pts,iqr_flip_error_pts,range_flip_error_pts
+1DTE ordinary days,3,0.00,0.36,0.73
+1DTE including roll-off day,4,0.09,1.17,4.13
+0DTE,5,5.09,13.89,27.94

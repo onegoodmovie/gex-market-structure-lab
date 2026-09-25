@@ -1,0 +1,5 @@
+bucket,observations,surface_opposes_count,median_mechanical_share_pct
+0DTE,10,10,120
+1-7DTE,10,10,114
+8-30DTE,10,4,95
+aggregate,10,9,112
