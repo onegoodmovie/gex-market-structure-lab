@@ -1,0 +1,23 @@
+# Never commit real credentials
+config/secrets.yaml
+.env
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Captured data is large and vendor-licensed; it stays local.
+data/raw_chain/
+data/normalized/
+data/derived/
+output/
+
+# Manual inputs ARE tracked — they are hand-maintained study records (§8, §5.4).
+!data/manual_input/
+!data/manual_input/*.csv
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
